@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nirvan - Your Emotional AI Companion</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Font Awesome for icons --><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        /* Custom styles for a calming, friendly aesthetic */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f4f8; /* Light blue-grey background */
+        }
+        .chat-container {
+            max-width: 800px;
+            height: 95vh;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            border-radius: 1.5rem;
+            overflow: hidden;
+            background-color: #ffffff;
+        }
+        .chat-header {
+            background-color: #5b21b6; /* Deep Violet */
+            color: white;
+            padding: 1rem 1.5rem;
+            border-top-left-radius: 1.5rem;
+            border-top-right-radius: 1.5rem;
+        }
+        #chat-window {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 1rem 1.5rem;
+            scroll-behavior: smooth;
+            background-color: #f7f9fc; /* Very light background for chat area */
+        }
+        .message-user {
+            background-color: #a78bfa; /* Medium Violet */
+            color: white;
+            max-width: 85%;
+            margin-left: auto;
+            border-radius: 1rem 1rem 0.25rem 1rem;
+        }
+        .message-bot {
+            background-color: #e0e7ff; /* Very light indigo */
+            color: #1e293b; /* Dark text */
+            max-width: 85%;
+            margin-right: auto;
+            border-radius: 1rem 1rem 1rem 0.25rem;
+        }
+        .input-area {
+            background-color: white;
+            border-top: 1px solid #e2e8f0;
+            padding: 1rem 1.5rem;
+        }
+        .avatar-bot {
+            background-color: #5b21b6;
+        }
+        .loading-dot {
+            animation: pulse 1s infinite;
+        }
+        .loading-dot:nth-child(2) { animation-delay: 0.2s; }
+        .loading-dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes pulse {
+            0%, 100% { opacity: 0.2; }
+            50% { opacity: 1; }
+        }
+    </style>
+    <!-- Firebase Imports --><script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- Global Firebase and Config Variables (MUST be set) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { /* Your default config here */ };
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const API_KEY = ""; // Leave as-is for Canvas to provide
+        
+        // Gemini Text Model
+        const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
+        
+        let db, auth, userId;
+        let isAuthReady = false;
+        
+        // Use the system instruction to define Nirvan's persona
+        const SYSTEM_INSTRUCTION = "You are Nirvan, a compassionate, supportive, and emotionally intelligent AI guide. Your primary purpose is to provide mental and emotional well-being assistance, acting as a friendly listener and offering gentle, practical, and constructive advice. Always use an empathetic, warm, and gentle tone. Prioritize safety: never give medical diagnoses or replace professional therapy. If the user expresses severe distress, thoughts of self-harm, or a crisis, you MUST urgently recommend seeking immediate professional help or contacting a local crisis hotline. Ground your advice using up-to-date information from Google Search where possible. Keep your responses concise, comforting, and encouraging.";
+
+        // --- Utility Functions ---
+
+        // Exponential backoff for API calls
+        async function fetchWithRetry(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) return response;
+                    if (response.status === 429 && i < maxRetries - 1) { // Too Many Requests
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        console.warn(`Retry ${i + 1}/${maxRetries} after delay...`);
+                        continue;
+                    }
+                    throw new Error(`API response error: ${response.statusText}`);
+                } catch (error) {
+                    if (i === maxRetries - 1) throw error;
+                    // Other errors (network, parsing) will be retried
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    console.warn(`Network error, retrying ${i + 1}/${maxRetries}...`);
+                }
+            }
+        }
+        
+        // --- Firebase/App Setup ---
+
+        function initFirebase() {
+            try {
+                // setLogLevel('debug'); // Uncomment for debugging
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                    } else {
+                        // Use a random UUID if anonymous sign-in failed (shouldn't happen with custom token)
+                        userId = crypto.randomUUID(); 
+                    }
+                    isAuthReady = true;
+                    console.log("Firebase Auth Ready. User ID:", userId);
+                    startChatListener();
+                });
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+            }
+        }
+
+        async function setupAuth() {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase authentication failed:", error);
+            }
+        }
+
+        // --- Firestore Operations ---
+
+        function getChatCollectionRef() {
+            if (!userId) throw new Error("User ID is not set for Firestore.");
+            // Private data path: /artifacts/{appId}/users/{userId}/nirvan_chat_history
+            const path = `/artifacts/${appId}/users/${userId}/nirvan_chat_history`;
+            return collection(db, path);
+        }
+
+        function startChatListener() {
+            if (!isAuthReady) return;
+
+            const chatRef = getChatCollectionRef();
+            const q = query(chatRef); 
+
+            onSnapshot(q, (snapshot) => {
+                const messages = [];
+                snapshot.forEach((doc) => {
+                    messages.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Sort messages manually by timestamp in memory to ensure correct order
+                messages.sort((a, b) => (a.timestamp?.toMillis() || 0) - (b.timestamp?.toMillis() || 0));
+                
+                renderChat(messages);
+            }, (error) => {
+                console.error("Firestore listener failed:", error);
+            });
+        }
+        
+        async function saveMessage(role, text, sources = []) {
+            try {
+                await addDoc(getChatCollectionRef(), {
+                    role: role,
+                    text: text,
+                    sources: sources,
+                    timestamp: serverTimestamp() 
+                });
+            } catch (error) {
+                console.error("Error saving message:", error);
+            }
+        }
+
+        // --- UI Rendering ---
+
+        function renderChat(messages) {
+            const chatWindow = document.getElementById('chat-window');
+            chatWindow.innerHTML = ''; // Clear existing messages
+
+            messages.forEach(msg => {
+                const isUser = msg.role === 'user';
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `flex mb-4 ${isUser ? 'justify-end' : 'justify-start'}`;
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = `p-4 rounded-xl shadow-md transition-all ${isUser ? 'message-user' : 'message-bot'}`;
+                
+                // Bot avatar for bot messages
+                if (!isUser) {
+                    const avatar = document.createElement('div');
+                    avatar.className = 'w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold text-white mr-3 shadow-lg avatar-bot flex-shrink-0';
+                    avatar.textContent = 'N';
+                    messageDiv.appendChild(avatar);
+                }
+
+                // Add text content
+                const textP = document.createElement('p');
+                // Basic markdown rendering (bold, italics) for a clean look
+                let formattedText = msg.text || "";
+                formattedText = formattedText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                formattedText = formattedText.replace(/\*(.*?)\*/g, '<em>$1</em>');
+                textP.innerHTML = formattedText;
+                contentDiv.appendChild(textP);
+
+                // Add sources if available and from the bot
+                if (!isUser && msg.sources && msg.sources.length > 0) {
+                    const sourceDiv = document.createElement('div');
+                    sourceDiv.className = 'mt-3 pt-2 border-t border-gray-300 text-xs text-gray-600';
+                    
+                    const sourceTitle = document.createElement('p');
+                    sourceTitle.className = 'font-semibold mb-1';
+                    sourceTitle.textContent = 'Sources:';
+                    sourceDiv.appendChild(sourceTitle);
+
+                    const sourceList = document.createElement('ul');
+                    sourceList.className = 'list-disc list-inside';
+                    msg.sources.slice(0, 3).forEach(source => { // Limit to 3 sources for brevity
+                        if (source.uri && source.title) {
+                            const listItem = document.createElement('li');
+                            const link = document.createElement('a');
+                            link.href = source.uri;
+                            link.target = "_blank";
+                            link.className = "hover:underline text-indigo-700";
+                            link.textContent = source.title;
+                            listItem.appendChild(link);
+                            sourceList.appendChild(listItem);
+                        }
+                    });
+                    sourceDiv.appendChild(sourceList);
+                    contentDiv.appendChild(sourceDiv);
+                }
+                
+                // Append content
+                messageDiv.appendChild(contentDiv);
+                
+                // User avatar for user messages
+                if (isUser) {
+                    const avatar = document.createElement('div');
+                    avatar.className = 'w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold text-white ml-3 shadow-lg bg-indigo-500 flex-shrink-0';
+                    avatar.textContent = 'You';
+                    messageDiv.appendChild(avatar);
+                }
+
+                chatWindow.appendChild(messageDiv);
+            });
+            // Scroll to the latest message
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        function showLoading() {
+            const chatWindow = document.getElementById('chat-window');
+            const loadingHtml = `
+                <div id="loading-indicator" class="flex mb-4 justify-start">
+                    <div class="w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold text-white mr-3 shadow-lg avatar-bot flex-shrink-0">N</div>
+                    <div class="message-bot p-4 rounded-xl shadow-md transition-all">
+                        <div class="flex space-x-1">
+                            <span class="loading-dot w-2 h-2 bg-gray-600 rounded-full"></span>
+                            <span class="loading-dot w-2 h-2 bg-gray-600 rounded-full"></span>
+                            <span class="loading-dot w-2 h-2 bg-gray-600 rounded-full"></span>
+                        </div>
+                    </div>
+                </div>
+            `;
+            chatWindow.insertAdjacentHTML('beforeend', loadingHtml);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        function hideLoading() {
+            document.getElementById('loading-indicator')?.remove();
+        }
+
+        // --- Gemini Chat API Call Logic (General Conversation) ---
+
+        async function getGeminiResponse(userQuery) {
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                // Enable Google Search for grounded emotional/mental health advice
+                tools: [{ "google_search": {} }],
+                systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+                config: {
+                    temperature: 0.7, // Slightly creative for empathy
+                }
+            };
+            
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            let response;
+            try {
+                response = await fetchWithRetry(API_URL, options);
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error("Gemini API Error Response:", errorText);
+                    return { text: "I encountered an error trying to process your request. Please try again later.", sources: [] };
+                }
+
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    const text = candidate.content.parts[0].text;
+                    
+                    let sources = [];
+                    const groundingMetadata = candidate.groundingMetadata;
+                    if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                        sources = groundingMetadata.groundingAttributions
+                            .map(attribution => ({
+                                uri: attribution.web?.uri,
+                                title: attribution.web?.title,
+                            }))
+                            .filter(source => source.uri && source.title);
+                    }
+                    return { text, sources };
+                }
+                
+                return { text: "I'm having trouble formulating a response right now. Could you rephrase your thought?", sources: [] };
+
+            } catch (error) {
+                console.error("API call failed after retries:", error);
+                return { text: "I apologize, but I am unable to connect to my core systems at the moment. Please try again in a moment.", sources: [] };
+            }
+        }
+
+        // --- Main Send Message Handler (General Chat) ---
+        
+        async function handleSendMessage(event) {
+            event.preventDefault();
+
+            const input = document.getElementById('chat-input');
+            const userQuery = input.value.trim();
+
+            if (!userQuery) return;
+            
+            // 1. Clear input and disable form
+            input.value = '';
+            document.getElementById('send-button').disabled = true;
+            input.disabled = true;
+
+            // 2. Save user message to Firestore
+            await saveMessage('user', userQuery);
+            
+            // 3. Show loading indicator while waiting for AI
+            showLoading();
+
+            // 4. Get response from Gemini
+            const { text: botResponse, sources } = await getGeminiResponse(userQuery);
+            
+            // 5. Hide loading indicator
+            hideLoading();
+            
+            // 6. Save bot message to Firestore
+            await saveMessage('model', botResponse, sources);
+
+            // 7. Re-enable form
+            document.getElementById('send-button').disabled = false;
+            input.disabled = false;
+            input.focus();
+        }
+
+        // --- Window Load and Event Listeners ---
+
+        window.onload = () => {
+            initFirebase();
+            setupAuth();
+
+            document.getElementById('chat-form').addEventListener('submit', handleSendMessage);
+        };
+        
+    </script>
+</head>
+<body>
+
+    <div class="chat-container">
+        <!-- Header --><header class="chat-header flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <!-- Updated Logo: Sparkling Lotus Flower --><i class="fas fa-gem text-2xl text-yellow-300"></i> <!-- Example of a new icon --><h1 class="text-3xl font-bold tracking-tight">Nirvan</h1>
+            </div>
+            <!-- Privacy Assurance Note --><div class="text-sm font-light text-right opacity-90 italic max-w-xs">
+                Your data is not captured for future use. Stay free to ask anything.
+            </div>
+        </header>
+
+        <!-- Chat Window --><div id="chat-window" class="flex-grow overflow-y-auto p-6 space-y-4">
+            <!-- Initial welcome message from Nirvan --><div class="flex mb-4 justify-start">
+                <div class="w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold text-white mr-3 shadow-lg avatar-bot flex-shrink-0">N</div>
+                <div class="message-bot p-4 rounded-xl shadow-md transition-all">
+                    <p>Hello there. I'm Nirvan, your supportive guide. I'm here to listen without judgment. How are you feeling today, and what's on your mind?</p>
+                </div>
+            </div>
+            <!-- Messages will be rendered here by JavaScript --></div>
+
+        <!-- Input Area --><div class="input-area flex flex-col space-y-3">
+            
+            <form id="chat-form" class="flex space-x-3">
+                <textarea 
+                    id="chat-input" 
+                    class="flex-grow p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-violet-500 focus:border-violet-500 transition duration-150 resize-none h-12 overflow-hidden" 
+                    placeholder="Share your thoughts with Nirvan..." 
+                    rows="1" 
+                    oninput="this.style.height = '';this.style.height = this.scrollHeight + 'px'"
+                    required
+                ></textarea>
+                <button 
+                    id="send-button" 
+                    type="submit" 
+                    class="bg-violet-600 hover:bg-violet-700 text-white font-semibold py-2 px-6 rounded-xl shadow-lg transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                >
+                    <i class="fas fa-paper-plane mr-2"></i> Send
+                </button>
+            </form>
+        </div>
+    </div>
+
+</body>
+</html>
